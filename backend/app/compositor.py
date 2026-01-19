@@ -26,6 +26,93 @@ class Compositor:
     def __init__(self):
         self.ad_asset: Optional[np.ndarray] = None
         self.ad_asset_id: Optional[str] = None
+        # Lighting adaptation settings
+        self.adapt_lighting = True
+        self.lighting_strength = 0.4  # How much to adapt (0=none, 1=full)
+
+    def _analyze_scene_lighting(
+        self,
+        frame: np.ndarray,
+        mask: np.ndarray,
+        bbox: tuple[int, int, int, int],
+    ) -> dict:
+        """
+        Analyze the lighting conditions around the masked region.
+        Returns brightness and color temperature adjustments.
+        """
+        x, y, w, h = [int(v) for v in bbox]
+        h_frame, w_frame = frame.shape[:2]
+
+        # Expand bbox to sample surrounding area
+        margin = 20
+        x1 = max(0, x - margin)
+        y1 = max(0, y - margin)
+        x2 = min(w_frame, x + w + margin)
+        y2 = min(h_frame, y + h + margin)
+
+        # Create inverse mask (surrounding area only)
+        region = frame[y1:y2, x1:x2]
+        region_mask = mask[y1:y2, x1:x2]
+        surrounding_mask = (region_mask == 0)
+
+        if not np.any(surrounding_mask):
+            # No surrounding pixels, return neutral
+            return {"brightness": 1.0, "color_shift": np.array([0, 0, 0], dtype=np.float32)}
+
+        # Sample surrounding pixels
+        surrounding_pixels = region[surrounding_mask]
+
+        # Calculate average brightness (using luminance formula)
+        avg_color = np.mean(surrounding_pixels, axis=0)  # BGR
+        brightness = 0.299 * avg_color[2] + 0.587 * avg_color[1] + 0.114 * avg_color[0]
+        brightness_factor = brightness / 128.0  # Normalize to ~1.0 for normal lighting
+
+        # Calculate color temperature bias
+        # Compare blue vs red to estimate warm/cool lighting
+        color_shift = avg_color - np.array([128, 128, 128], dtype=np.float32)
+
+        return {
+            "brightness": np.clip(brightness_factor, 0.5, 1.5),
+            "color_shift": color_shift * 0.3,  # Reduce intensity of color shift
+        }
+
+    def _apply_lighting_adjustment(
+        self,
+        asset: np.ndarray,
+        lighting: dict,
+    ) -> np.ndarray:
+        """
+        Apply lighting adjustments to the ad asset.
+        """
+        result = asset.astype(np.float32)
+
+        # Separate alpha channel if present
+        if result.shape[2] == 4:
+            bgr = result[:, :, :3]
+            alpha = result[:, :, 3:4]
+        else:
+            bgr = result
+            alpha = None
+
+        # Apply brightness adjustment
+        brightness = lighting["brightness"]
+        strength = self.lighting_strength
+        adjusted_brightness = 1.0 + (brightness - 1.0) * strength
+        bgr = bgr * adjusted_brightness
+
+        # Apply color shift
+        color_shift = lighting["color_shift"] * strength
+        bgr = bgr + color_shift
+
+        # Clip to valid range
+        bgr = np.clip(bgr, 0, 255)
+
+        if alpha is not None:
+            result = np.concatenate([bgr, alpha], axis=2)
+        else:
+            result = bgr
+
+        return result.astype(np.uint8)
 
     def load_ad_asset(self, ad_id: str):
         """Load an ad asset image."""
@@ -83,26 +170,54 @@ class Compositor:
         mask: np.ndarray,
         bbox: tuple[float, float, float, float],
         centroid: tuple[float, float],
+        occlusion_mask: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """
         Composite the ad asset onto the frame.
 
         1. Inpaint the masked region (remove original object)
         2. Overlay the ad asset at the correct position and scale
+        3. Apply occlusion mask to show hands/fingers in front of ad
+
+        Args:
+            frame: Input BGR frame
+            mask: Binary mask of object to replace
+            bbox: Bounding box (x, y, w, h) - smoothed
+            centroid: Center point (x, y) - smoothed
+            occlusion_mask: Optional binary mask where 1 = occluding pixels (hands/body)
         """
         if self.ad_asset is None:
             return frame
 
+        # Keep a copy of the original frame for occlusion handling
+        original_frame = frame.copy()
         result = frame.copy()
 
-        # Step 1: Inpaint the masked region
+        # Step 1: Inpaint the masked region with improved quality
         mask_uint8 = (mask * 255).astype(np.uint8)
-        # Dilate mask slightly for better inpainting
+
+        # Create dilated mask for inpainting (slightly larger to cover edges)
         kernel = np.ones((5, 5), np.uint8)
         dilated_mask = cv2.dilate(mask_uint8, kernel, iterations=2)
 
-        # Use OpenCV inpainting (Telea algorithm)
-        result = cv2.inpaint(result, dilated_mask, 5, cv2.INPAINT_TELEA)
+        # Create edge mask for blending
+        edge_mask = cv2.dilate(mask_uint8, kernel, iterations=3) - cv2.erode(mask_uint8, kernel, iterations=1)
+
+        # Use Navier-Stokes inpainting with larger radius for better quality on large areas
+        # NS method is better for larger regions, Telea is faster for small regions
+        inpaint_radius = 7  # Larger radius for smoother results
+        result = cv2.inpaint(result, dilated_mask, inpaint_radius, cv2.INPAINT_NS)
+
+        # Apply slight blur at the inpainting boundary for smoother blending
+        if np.any(edge_mask):
+            # Create a soft edge mask for blending
+            edge_float = edge_mask.astype(np.float32) / 255.0
+            edge_blurred = cv2.GaussianBlur(edge_float, (7, 7), 0)
+
+            # Blend original edge pixels with inpainted result for smoother transition
+            edge_alpha = edge_blurred[:, :, np.newaxis]
+            blurred_result = cv2.GaussianBlur(result, (3, 3), 0)
+            result = (edge_alpha * blurred_result + (1 - edge_alpha) * result).astype(np.uint8)
 
         # Step 2: Overlay ad asset
         x, y, w, h = [int(v) for v in bbox]
@@ -139,6 +254,11 @@ class Compositor:
         except cv2.error:
             return result
 
+        # Step 2.5: Apply lighting adaptation to match scene
+        if self.adapt_lighting:
+            lighting = self._analyze_scene_lighting(original_frame, mask, bbox)
+            scaled_asset = self._apply_lighting_adjustment(scaled_asset, lighting)
+
         # Position asset at centroid
         cx, cy = [int(v) for v in centroid]
         overlay_x = cx - new_w // 2
@@ -169,5 +289,26 @@ class Compositor:
         # Blend: result = alpha * foreground + (1 - alpha) * background
         blended = (alpha * bgr + (1 - alpha) * frame_region).astype(np.uint8)
         result[dst_y1:dst_y2, dst_x1:dst_x2] = blended
+
+        # Step 3: Apply occlusion mask (restore original pixels where hands/body are)
+        if occlusion_mask is not None:
+            # Only apply occlusion within the region affected by the ad
+            # Expand the occlusion mask to ensure clean edges
+            kernel = np.ones((3, 3), np.uint8)
+            occlusion_dilated = cv2.dilate(occlusion_mask, kernel, iterations=1)
+
+            # Also check intersection with the object mask - only occlude where
+            # the person overlaps with the replaced object region
+            intersection = occlusion_dilated & (mask > 0)
+
+            if np.any(intersection):
+                # Feather the edge for smoother blending
+                intersection_float = intersection.astype(np.float32)
+                intersection_blurred = cv2.GaussianBlur(intersection_float, (5, 5), 0)
+                occlusion_alpha = intersection_blurred[:, :, np.newaxis]
+
+                # Blend original frame pixels where there's occlusion
+                result = (occlusion_alpha * original_frame +
+                         (1 - occlusion_alpha) * result).astype(np.uint8)
 
         return result

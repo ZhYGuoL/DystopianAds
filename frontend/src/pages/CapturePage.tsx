@@ -13,6 +13,8 @@ interface Detection {
   confidence: number
   bbox: [number, number, number, number] // x1, y1, x2, y2
   center: [number, number]
+  track_id: number | null
+  contour: [number, number][] | null // Segmentation contour points
 }
 
 const AD_ASSETS: AdAsset[] = [
@@ -44,7 +46,7 @@ export default function CapturePage() {
     async function setupWebcam() {
       try {
         const stream = await navigator.mediaDevices.getUserMedia({
-          video: { width: { ideal: 640 }, height: { ideal: 480 } },
+          video: { width: { ideal: 1280 }, height: { ideal: 720 } },
           audio: false,
         })
         if (videoRef.current) {
@@ -108,7 +110,7 @@ export default function CapturePage() {
           0.8
         )
 
-        setTimeout(() => requestAnimationFrame(sendFrame), 66)
+        setTimeout(() => requestAnimationFrame(sendFrame), 33)
       }
 
       const video = videoRef.current
@@ -213,7 +215,7 @@ export default function CapturePage() {
     }
   }, [])
 
-  // Calculate box position for overlay
+  // Calculate box position for overlay (fallback when no contour)
   const getBoxStyle = (bbox: [number, number, number, number]) => {
     const [x1, y1, x2, y2] = bbox
     const container = containerRef.current
@@ -228,6 +230,42 @@ export default function CapturePage() {
       top: `${y1 * scaleY}px`,
       width: `${(x2 - x1) * scaleX}px`,
       height: `${(y2 - y1) * scaleY}px`,
+    }
+  }
+
+  // Convert contour points to scaled SVG polygon points string
+  const getContourPoints = (contour: [number, number][]) => {
+    const container = containerRef.current
+    if (!container) return ''
+
+    const rect = container.getBoundingClientRect()
+    const scaleX = rect.width / videoDimensions.width
+    const scaleY = rect.height / videoDimensions.height
+
+    return contour.map(([x, y]) => `${x * scaleX},${y * scaleY}`).join(' ')
+  }
+
+  // Get label position for contour (use first point or bbox top-left)
+  const getLabelPosition = (det: Detection) => {
+    const container = containerRef.current
+    if (!container) return { left: 0, top: 0 }
+
+    const rect = container.getBoundingClientRect()
+    const scaleX = rect.width / videoDimensions.width
+    const scaleY = rect.height / videoDimensions.height
+
+    if (det.contour && det.contour.length > 0) {
+      // Find topmost point for label
+      const topPoint = det.contour.reduce((min, pt) => pt[1] < min[1] ? pt : min, det.contour[0])
+      return {
+        left: topPoint[0] * scaleX,
+        top: topPoint[1] * scaleY - 24,
+      }
+    }
+    // Fallback to bbox
+    return {
+      left: det.bbox[0] * scaleX,
+      top: det.bbox[1] * scaleY - 24,
     }
   }
 
@@ -260,26 +298,65 @@ export default function CapturePage() {
                   className="w-full rounded-lg bg-black"
                 />
 
-                {/* Detection bounding boxes */}
-                {detections.map((det) => (
-                  <div
-                    key={det.id}
-                    className={`absolute border-2 pointer-events-none ${
-                      selectedDetection?.id === det.id
-                        ? 'border-green-500 bg-green-500/20'
-                        : 'border-yellow-400 bg-yellow-400/10'
-                    }`}
-                    style={getBoxStyle(det.bbox)}
-                  >
-                    <div className={`absolute -top-6 left-0 text-xs px-1 rounded ${
-                      selectedDetection?.id === det.id
-                        ? 'bg-green-500 text-white'
-                        : 'bg-yellow-400 text-black'
-                    }`}>
+                {/* Detection contours/boxes - SVG overlay */}
+                <svg
+                  className="absolute inset-0 w-full h-full pointer-events-none"
+                  style={{ overflow: 'visible' }}
+                >
+                  {detections.map((det) => {
+                    const isSelected = selectedDetection?.id === det.id
+                    const strokeColor = isSelected ? '#22c55e' : '#facc15' // green-500 / yellow-400
+                    const fillColor = isSelected ? 'rgba(34, 197, 94, 0.2)' : 'rgba(250, 204, 21, 0.1)'
+
+                    if (det.contour && det.contour.length > 2) {
+                      // Draw contour polygon
+                      return (
+                        <polygon
+                          key={det.id}
+                          points={getContourPoints(det.contour)}
+                          fill={fillColor}
+                          stroke={strokeColor}
+                          strokeWidth="2"
+                        />
+                      )
+                    } else {
+                      // Fallback to rectangle
+                      const style = getBoxStyle(det.bbox)
+                      return (
+                        <rect
+                          key={det.id}
+                          x={parseFloat(style.left as string) || 0}
+                          y={parseFloat(style.top as string) || 0}
+                          width={parseFloat(style.width as string) || 0}
+                          height={parseFloat(style.height as string) || 0}
+                          fill={fillColor}
+                          stroke={strokeColor}
+                          strokeWidth="2"
+                        />
+                      )
+                    }
+                  })}
+                </svg>
+
+                {/* Detection labels */}
+                {detections.map((det) => {
+                  const pos = getLabelPosition(det)
+                  const isSelected = selectedDetection?.id === det.id
+                  return (
+                    <div
+                      key={`label-${det.id}`}
+                      className={`absolute text-xs px-1 rounded pointer-events-none ${
+                        isSelected
+                          ? 'bg-green-500 text-white'
+                          : 'bg-yellow-400 text-black'
+                      }`}
+                      style={{ left: pos.left, top: pos.top }}
+                    >
                       {det.class} {Math.round(det.confidence * 100)}%
+                      {det.track_id !== null && <span className="ml-1 opacity-70">#{det.track_id}</span>}
                     </div>
-                  </div>
-                ))}
+                  )
+                })}
 
                 {/* Status overlay */}
                 <div className="absolute top-2 left-2 bg-black/80 text-white text-sm px-3 py-2 rounded max-w-xs">
