@@ -46,12 +46,14 @@ current_occlusion_mask: Optional[np.ndarray] = None  # Current person/hand occlu
 
 # Frame buffer for viewer - stores (timestamp, frame, detections) tuples with 1 second delay
 frame_buffer: deque = deque(maxlen=100)
+buffer_processor_task: Optional[asyncio.Task] = None
+BUFFER_DELAY_MS = 1000  # 1 second delay
 
 
 @app.on_event("startup")
 async def startup():
     """Initialize services on startup."""
-    global detector
+    global detector, buffer_processor_task
     logger.info("Initializing YOLO detector with segmentation model...")
     # Using yolo26m-seg for good accuracy + real-time performance
     # Options: yolo26s-seg (fast), yolo26m-seg (balanced), yolo26l-seg (accurate), yolo26x-seg (best)
@@ -62,6 +64,9 @@ async def startup():
         imgsz=640,
     )
     logger.info("YOLO detector ready (yolo26n, ByteTrack, 640px - optimized for speed)")
+
+    # Start background buffer processor task
+    buffer_processor_task = asyncio.create_task(buffer_processor_loop())
 
 
 @app.get("/api/health")
@@ -187,9 +192,6 @@ async def capture_websocket(websocket: WebSocket):
                     'frame_num': frame_count,
                 })
 
-                # Process buffered frames (with 1 second delay)
-                asyncio.create_task(process_buffered_frames())
-
             elif "text" in message:
                 # JSON control message
                 try:
@@ -282,85 +284,116 @@ async def viewer_websocket(websocket: WebSocket):
         logger.info(f"Viewer disconnected. Total: {len(viewer_connections)}")
 
 
-async def process_buffered_frames():
-    """Process frames from buffer with 1-second delay and draw detection boxes."""
-    global selected_detection, current_occlusion_mask
-
-    current_time = time.time()
-    delay_threshold = 1.0  # 1 second delay
-
-    # Check if any frames are ready (1+ seconds old)
-    if not frame_buffer:
-        return
-
-    # Get the oldest frame
-    oldest = frame_buffer[0]
-    if current_time - oldest['timestamp'] >= delay_threshold:
-        # Frame is old enough, process it
-        frame_data = frame_buffer.popleft()
-
+async def buffer_processor_loop():
+    """Background task to process buffered frames at steady rate."""
+    logger.info("Buffer processor task started")
+    while True:
         try:
-            # Process frame through pipeline
-            processed = await pipeline.process_frame(
-                frame_data['frame'],
-                frame_data['frame_num'],
-                occlusion_mask=current_occlusion_mask,
-            )
+            await asyncio.sleep(0.033)  # ~30 FPS processing
 
-            # Draw ALL detection boxes with bounding boxes
-            for detection in frame_data['detections']:
-                x1, y1, x2, y2 = detection.bbox
-                # Yellow for all detections
-                cv2.rectangle(processed, (x1, y1), (x2, y2), (0, 255, 255), 2)
-                # Draw label
-                label = f"{detection.class_name} {int(detection.confidence*100)}%"
-                cv2.putText(
-                    processed,
-                    label,
-                    (x1, y1 - 5),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5,
-                    (0, 255, 255),
-                    2,
-                )
+            current_time = time.time()
+            delay_threshold = BUFFER_DELAY_MS / 1000.0  # Convert to seconds
 
-            # Draw selected detection in green
-            if selected_detection:
-                x1, y1, x2, y2 = selected_detection.bbox
-                cv2.rectangle(processed, (x1, y1), (x2, y2), (0, 255, 0), 3)
-                cv2.putText(
-                    processed,
-                    f"Replacing: {selected_detection.class_name}",
-                    (x1, y1 - 20),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    (0, 255, 0),
-                    2,
-                )
-
-            # Convert to RGB and encode
-            if len(processed.shape) == 3 and processed.shape[2] == 3:
-                processed = processed[:, :, ::-1]  # BGR to RGB
-
-            output_img = Image.fromarray(processed)
-            output_buffer = io.BytesIO()
-            output_img.save(output_buffer, format="JPEG", quality=85)
-            output_bytes = output_buffer.getvalue()
-
-            # Broadcast to viewers
-            disconnected = []
-            for viewer in viewer_connections:
-                try:
-                    await viewer.send_bytes(output_bytes)
-                except Exception:
-                    disconnected.append(viewer)
-
-            for viewer in disconnected:
-                if viewer in viewer_connections:
-                    viewer_connections.remove(viewer)
+            # Process ALL frames that are old enough
+            while frame_buffer:
+                oldest = frame_buffer[0]
+                if current_time - oldest['timestamp'] >= delay_threshold:
+                    frame_data = frame_buffer.popleft()
+                    await process_buffered_frame(frame_data, current_time)
+                else:
+                    break  # Oldest frame not ready yet, stop processing
 
         except Exception as e:
-            logger.error(f"Buffered frame processing error: {e}")
+            logger.error(f"Buffer processor loop error: {e}")
+
+
+async def process_buffered_frame(frame_data: dict, process_time: float):
+    """Process a single buffered frame and draw detections with contours."""
+    global selected_detection, current_occlusion_mask
+
+    try:
+        proc_start = time.time()
+
+        # Process frame through pipeline
+        processed = await pipeline.process_frame(
+            frame_data['frame'],
+            frame_data['frame_num'],
+            occlusion_mask=current_occlusion_mask,
+        )
+
+        # Draw ALL detections with segmentation contours
+        for detection in frame_data['detections']:
+            # Draw segmentation contour if available, otherwise use bbox
+            if detection.contour and len(detection.contour) > 2:
+                # Convert contour to numpy array format for cv2.polylines
+                contour_points = np.array(detection.contour, dtype=np.int32)
+                # Yellow for all detections
+                cv2.polylines(processed, [contour_points], isClosed=True, color=(0, 255, 255), thickness=2)
+            else:
+                # Fallback to bounding box
+                x1, y1, x2, y2 = detection.bbox
+                cv2.rectangle(processed, (x1, y1), (x2, y2), (0, 255, 255), 2)
+
+            # Draw label
+            x1, y1, x2, y2 = detection.bbox
+            label = f"{detection.class_name} {int(detection.confidence*100)}%"
+            cv2.putText(
+                processed,
+                label,
+                (x1, y1 - 5),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (0, 255, 255),
+                2,
+            )
+
+        # Draw selected detection in green with thicker contour
+        if selected_detection:
+            if selected_detection.contour and len(selected_detection.contour) > 2:
+                contour_points = np.array(selected_detection.contour, dtype=np.int32)
+                cv2.polylines(processed, [contour_points], isClosed=True, color=(0, 255, 0), thickness=3)
+            else:
+                x1, y1, x2, y2 = selected_detection.bbox
+                cv2.rectangle(processed, (x1, y1), (x2, y2), (0, 255, 0), 3)
+
+            x1, y1, x2, y2 = selected_detection.bbox
+            cv2.putText(
+                processed,
+                f"Replacing: {selected_detection.class_name}",
+                (x1, y1 - 20),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 255, 0),
+                2,
+            )
+
+        # Convert to RGB and encode
+        if len(processed.shape) == 3 and processed.shape[2] == 3:
+            processed = processed[:, :, ::-1]  # BGR to RGB
+
+        output_img = Image.fromarray(processed)
+        output_buffer = io.BytesIO()
+        output_img.save(output_buffer, format="JPEG", quality=85)
+        output_bytes = output_buffer.getvalue()
+
+        proc_duration = (time.time() - proc_start) * 1000
+        age_ms = (process_time - frame_data['timestamp']) * 1000
+        logger.info(f"[Viewer] Frame {frame_data['frame_num']} | Age: {age_ms:.0f}ms | Process: {proc_duration:.1f}ms | Buffer: {len(frame_buffer)}")
+
+        # Broadcast to viewers
+        disconnected = []
+        for viewer in viewer_connections:
+            try:
+                await viewer.send_bytes(output_bytes)
+            except Exception:
+                disconnected.append(viewer)
+
+        for viewer in disconnected:
+            if viewer in viewer_connections:
+                viewer_connections.remove(viewer)
+
+    except Exception as e:
+        logger.error(f"Buffered frame processing error: {e}")
 
 
 async def process_and_broadcast(frame: np.ndarray, frame_num: int):
