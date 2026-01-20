@@ -44,6 +44,9 @@ selected_class_name: Optional[str] = None  # Fallback: track by class name
 last_frame_shape: tuple[int, int, int] = (480, 640, 3)  # Default shape, updated on each frame
 current_occlusion_mask: Optional[np.ndarray] = None  # Current person/hand occlusion mask
 
+# Frame buffer for viewer - stores (timestamp, frame, detections) tuples with 1 second delay
+frame_buffer: deque = deque(maxlen=100)
+
 
 @app.on_event("startup")
 async def startup():
@@ -54,11 +57,11 @@ async def startup():
     # Options: yolo26s-seg (fast), yolo26m-seg (balanced), yolo26l-seg (accurate), yolo26x-seg (best)
     # imgsz: 640 (fast), 960 (balanced), 1280 (accurate)
     detector = DetectionService(
-        model_name="yolo26m-seg.pt",
+        model_name="yolo26n.pt",
         use_tracking=True,
-        imgsz=1280,
+        imgsz=640,
     )
-    logger.info("YOLO detector ready (yolo26m-seg, ByteTrack, 1280px)")
+    logger.info("YOLO detector ready (yolo26n, ByteTrack, 640px - optimized for speed)")
 
 
 @app.get("/api/health")
@@ -176,8 +179,16 @@ async def capture_websocket(websocket: WebSocket):
                     "data": det_data,
                 })
 
-                # Process and broadcast to viewers
-                asyncio.create_task(process_and_broadcast(frame, frame_count))
+                # Add frame to buffer with current detections for delayed viewer processing
+                frame_buffer.append({
+                    'timestamp': time.time(),
+                    'frame': frame.copy(),
+                    'detections': list(current_detections),
+                    'frame_num': frame_count,
+                })
+
+                # Process buffered frames (with 1 second delay)
+                asyncio.create_task(process_buffered_frames())
 
             elif "text" in message:
                 # JSON control message
@@ -269,6 +280,87 @@ async def viewer_websocket(websocket: WebSocket):
         if websocket in viewer_connections:
             viewer_connections.remove(websocket)
         logger.info(f"Viewer disconnected. Total: {len(viewer_connections)}")
+
+
+async def process_buffered_frames():
+    """Process frames from buffer with 1-second delay and draw detection boxes."""
+    global selected_detection, current_occlusion_mask
+
+    current_time = time.time()
+    delay_threshold = 1.0  # 1 second delay
+
+    # Check if any frames are ready (1+ seconds old)
+    if not frame_buffer:
+        return
+
+    # Get the oldest frame
+    oldest = frame_buffer[0]
+    if current_time - oldest['timestamp'] >= delay_threshold:
+        # Frame is old enough, process it
+        frame_data = frame_buffer.popleft()
+
+        try:
+            # Process frame through pipeline
+            processed = await pipeline.process_frame(
+                frame_data['frame'],
+                frame_data['frame_num'],
+                occlusion_mask=current_occlusion_mask,
+            )
+
+            # Draw ALL detection boxes with bounding boxes
+            for detection in frame_data['detections']:
+                x1, y1, x2, y2 = detection.bbox
+                # Yellow for all detections
+                cv2.rectangle(processed, (x1, y1), (x2, y2), (0, 255, 255), 2)
+                # Draw label
+                label = f"{detection.class_name} {int(detection.confidence*100)}%"
+                cv2.putText(
+                    processed,
+                    label,
+                    (x1, y1 - 5),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (0, 255, 255),
+                    2,
+                )
+
+            # Draw selected detection in green
+            if selected_detection:
+                x1, y1, x2, y2 = selected_detection.bbox
+                cv2.rectangle(processed, (x1, y1), (x2, y2), (0, 255, 0), 3)
+                cv2.putText(
+                    processed,
+                    f"Replacing: {selected_detection.class_name}",
+                    (x1, y1 - 20),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (0, 255, 0),
+                    2,
+                )
+
+            # Convert to RGB and encode
+            if len(processed.shape) == 3 and processed.shape[2] == 3:
+                processed = processed[:, :, ::-1]  # BGR to RGB
+
+            output_img = Image.fromarray(processed)
+            output_buffer = io.BytesIO()
+            output_img.save(output_buffer, format="JPEG", quality=85)
+            output_bytes = output_buffer.getvalue()
+
+            # Broadcast to viewers
+            disconnected = []
+            for viewer in viewer_connections:
+                try:
+                    await viewer.send_bytes(output_bytes)
+                except Exception:
+                    disconnected.append(viewer)
+
+            for viewer in disconnected:
+                if viewer in viewer_connections:
+                    viewer_connections.remove(viewer)
+
+        except Exception as e:
+            logger.error(f"Buffered frame processing error: {e}")
 
 
 async def process_and_broadcast(frame: np.ndarray, frame_num: int):
