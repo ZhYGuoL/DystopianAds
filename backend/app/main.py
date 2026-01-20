@@ -59,11 +59,11 @@ async def startup():
     # Options: yolo26s-seg (fast), yolo26m-seg (balanced), yolo26l-seg (accurate), yolo26x-seg (best)
     # imgsz: 640 (fast), 960 (balanced), 1280 (accurate)
     detector = DetectionService(
-        model_name="yolo26n.pt",
+        model_name="yolo26s-seg.pt",
         use_tracking=True,
-        imgsz=640,
+        imgsz=480,
     )
-    logger.info("YOLO detector ready (yolo26n, ByteTrack, 640px - optimized for speed)")
+    logger.info("YOLO detector ready (yolo26s-seg, ByteTrack, 480px - optimized for speed+segmentation)")
 
     # Start background buffer processor task
     buffer_processor_task = asyncio.create_task(buffer_processor_loop())
@@ -289,19 +289,18 @@ async def buffer_processor_loop():
     logger.info("Buffer processor task started")
     while True:
         try:
-            await asyncio.sleep(0.033)  # ~30 FPS processing
-
             current_time = time.time()
             delay_threshold = BUFFER_DELAY_MS / 1000.0  # Convert to seconds
 
-            # Process ALL frames that are old enough
-            while frame_buffer:
+            # Process ONE frame per iteration if available
+            if frame_buffer:
                 oldest = frame_buffer[0]
                 if current_time - oldest['timestamp'] >= delay_threshold:
                     frame_data = frame_buffer.popleft()
                     await process_buffered_frame(frame_data, current_time)
-                else:
-                    break  # Oldest frame not ready yet, stop processing
+
+            # Sleep briefly to avoid busy-waiting
+            await asyncio.sleep(0.01)  # 10ms
 
         except Exception as e:
             logger.error(f"Buffer processor loop error: {e}")
@@ -322,6 +321,8 @@ async def process_buffered_frame(frame_data: dict, process_time: float):
         )
 
         # Draw ALL detections with segmentation contours
+        contour_count = 0
+        bbox_count = 0
         for detection in frame_data['detections']:
             # Draw segmentation contour if available, otherwise use bbox
             if detection.contour and len(detection.contour) > 2:
@@ -329,10 +330,12 @@ async def process_buffered_frame(frame_data: dict, process_time: float):
                 contour_points = np.array(detection.contour, dtype=np.int32)
                 # Yellow for all detections
                 cv2.polylines(processed, [contour_points], isClosed=True, color=(0, 255, 255), thickness=2)
+                contour_count += 1
             else:
                 # Fallback to bounding box
                 x1, y1, x2, y2 = detection.bbox
                 cv2.rectangle(processed, (x1, y1), (x2, y2), (0, 255, 255), 2)
+                bbox_count += 1
 
             # Draw label
             x1, y1, x2, y2 = detection.bbox
@@ -378,7 +381,7 @@ async def process_buffered_frame(frame_data: dict, process_time: float):
 
         proc_duration = (time.time() - proc_start) * 1000
         age_ms = (process_time - frame_data['timestamp']) * 1000
-        logger.info(f"[Viewer] Frame {frame_data['frame_num']} | Age: {age_ms:.0f}ms | Process: {proc_duration:.1f}ms | Buffer: {len(frame_buffer)}")
+        logger.info(f"[Viewer] Frame {frame_data['frame_num']} | Age: {age_ms:.0f}ms | Process: {proc_duration:.1f}ms | Contours: {contour_count} | BBox: {bbox_count} | Buffer: {len(frame_buffer)}")
 
         # Broadcast to viewers
         disconnected = []
