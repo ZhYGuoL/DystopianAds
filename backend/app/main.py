@@ -45,19 +45,22 @@ selected_class_name: Optional[str] = None  # Fallback: track by class name
 last_frame_shape: tuple[int, int, int] = (480, 640, 3)  # Default shape, updated on each frame
 current_occlusion_mask: Optional[np.ndarray] = None  # Current person/hand occlusion mask
 
-# Frame buffer for viewer - stores (timestamp, frame, detections) tuples with minimal delay
-frame_buffer: deque = deque(maxlen=100)
+# Frame buffer for viewer - stores (timestamp, frame, detections) tuples with guaranteed constant delay
+frame_buffer: deque = deque(maxlen=150)  # Larger buffer for constant delay window
 buffer_processor_task: Optional[asyncio.Task] = None
-BUFFER_DELAY_MS = 100  # 100ms delay to let detections catch up
+BUFFER_DELAY_MS = 200  # 200ms constant delay to guarantee encoding completes
+last_viewer_frame_num = 0
 
 # Thread pool for non-blocking YOLO inference
 detection_executor: Optional[ThreadPoolExecutor] = None
+# Thread pool for frame encoding
+encode_executor: Optional[ThreadPoolExecutor] = None
 
 
 @app.on_event("startup")
 async def startup():
     """Initialize services on startup."""
-    global detector, buffer_processor_task, detection_executor
+    global detector, buffer_processor_task, detection_executor, encode_executor
     logger.info("Initializing YOLO detector with segmentation model...")
     # Using yolo26m-seg for good accuracy + real-time performance
     # Options: yolo26s-seg (fast), yolo26m-seg (balanced), yolo26l-seg (accurate), yolo26x-seg (best)
@@ -69,8 +72,9 @@ async def startup():
     )
     logger.info("YOLO detector ready (yolo26s-seg, ByteTrack, 480px - optimized for speed+segmentation)")
 
-    # Initialize thread pool for non-blocking YOLO inference
+    # Initialize thread pools for parallel processing
     detection_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="yolo-")
+    encode_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="encode-")
 
     # Start background buffer processor task
     buffer_processor_task = asyncio.create_task(buffer_processor_loop())
@@ -194,7 +198,7 @@ async def capture_websocket(websocket: WebSocket):
                     "data": det_data,
                 })
 
-                # Add frame to buffer with current detections for delayed viewer processing
+                # Always add frame to buffer - the processor handles backlog
                 frame_buffer.append({
                     'timestamp': time.time(),
                     'frame': frame.copy(),
@@ -295,28 +299,62 @@ async def viewer_websocket(websocket: WebSocket):
 
 
 async def buffer_processor_loop():
-    """Background task to process buffered frames at steady rate."""
+    """Background task to process buffered frames at steady rate with constant delay."""
+    global last_viewer_frame_num
     logger.info("Buffer processor task started")
     while True:
         try:
             current_time = time.time()
             delay_threshold = BUFFER_DELAY_MS / 1000.0  # Convert to seconds
 
-            # Process all frames that are old enough (drain buffer)
+            # Aggressive frame dropping if buffer exceeds safe size
+            # This prevents lag accumulation by maintaining steady throughput
+            if len(frame_buffer) > 50:
+                # Drop frames older than delay_threshold to catch up quickly
+                dropped_count = 0
+                while len(frame_buffer) > 40:
+                    oldest = frame_buffer[0]
+                    if current_time - oldest['timestamp'] > delay_threshold * 1.5:  # 1.5x delay window
+                        dropped = frame_buffer.popleft()
+                        dropped_count += 1
+                    else:
+                        break
+                if dropped_count > 0:
+                    logger.warning(f"[Buffer Drop] Dropped {dropped_count} old frames - buffer at {len(frame_buffer)}")
+
+            # Process all frames that are old enough (maintain constant delay)
+            processed_count = 0
             while frame_buffer:
                 oldest = frame_buffer[0]
                 if current_time - oldest['timestamp'] >= delay_threshold:
                     frame_data = frame_buffer.popleft()
                     await process_buffered_frame(frame_data, current_time)
+                    last_viewer_frame_num = frame_data['frame_num']
                     current_time = time.time()  # Update time after processing
+                    processed_count += 1
                 else:
-                    break  # Oldest frame not ready yet
+                    break  # Oldest frame not ready yet, wait for delay window
 
-            # Sleep very briefly to yield to other tasks
-            await asyncio.sleep(0.001)  # 1ms
+            # Sleep briefly to yield to other tasks
+            await asyncio.sleep(0.005)  # 5ms - allows 200 buffer processes/sec
 
         except Exception as e:
             logger.error(f"Buffer processor loop error: {e}")
+
+
+def encode_frame_to_jpeg(frame_rgb: np.ndarray) -> bytes:
+    """Encode frame to JPEG bytes (blocking, meant for thread pool)."""
+    # Scale down frame for faster encoding if needed
+    h, w = frame_rgb.shape[:2]
+    if w > 960:  # Only scale if large
+        scale = 960 / w
+        new_h = int(h * scale)
+        frame_rgb = cv2.resize(frame_rgb, (960, new_h), interpolation=cv2.INTER_LINEAR)
+
+    output_img = Image.fromarray(frame_rgb)
+    output_buffer = io.BytesIO()
+    output_img.save(output_buffer, format="JPEG", quality=70)  # Reduced quality for speed
+    return output_buffer.getvalue()
 
 
 async def process_buffered_frame(frame_data: dict, process_time: float):
@@ -328,11 +366,14 @@ async def process_buffered_frame(frame_data: dict, process_time: float):
 
         # Use frame directly without heavy pipeline processing for viewer speed
         # (pipeline processing adds object replacement which viewer doesn't need)
+        t_copy = time.time()
         processed = frame_data['frame'].copy()
+        copy_time = (time.time() - t_copy) * 1000
 
         # Draw ALL detections with segmentation contours
         contour_count = 0
         bbox_count = 0
+        t_draw = time.time()
         for detection in frame_data['detections']:
             # Draw segmentation contour if available, otherwise use bbox
             if detection.contour and len(detection.contour) > 2:
@@ -379,19 +420,25 @@ async def process_buffered_frame(frame_data: dict, process_time: float):
                 (0, 255, 0),
                 2,
             )
+        draw_time = (time.time() - t_draw) * 1000
 
-        # Convert to RGB and encode
+        # Convert to RGB
         if len(processed.shape) == 3 and processed.shape[2] == 3:
             processed = processed[:, :, ::-1]  # BGR to RGB
 
-        output_img = Image.fromarray(processed)
-        output_buffer = io.BytesIO()
-        output_img.save(output_buffer, format="JPEG", quality=85)
-        output_bytes = output_buffer.getvalue()
+        # Encode JPEG in thread pool to avoid blocking event loop
+        t_encode = time.time()
+        loop = asyncio.get_event_loop()
+        output_bytes = await loop.run_in_executor(
+            encode_executor,
+            encode_frame_to_jpeg,
+            processed,
+        )
+        encode_time = (time.time() - t_encode) * 1000
 
         proc_duration = (time.time() - proc_start) * 1000
         age_ms = (process_time - frame_data['timestamp']) * 1000
-        logger.info(f"[Viewer] Frame {frame_data['frame_num']} | Age: {age_ms:.0f}ms | Process: {proc_duration:.1f}ms | Contours: {contour_count} | BBox: {bbox_count} | Buffer: {len(frame_buffer)}")
+        logger.info(f"[Viewer] Frame {frame_data['frame_num']} | Age: {age_ms:.0f}ms | Total: {proc_duration:.1f}ms [copy:{copy_time:.1f} draw:{draw_time:.1f} encode:{encode_time:.1f}] | Contours: {contour_count} | Buffer: {len(frame_buffer)}")
 
         # Broadcast to viewers
         disconnected = []

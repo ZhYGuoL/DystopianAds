@@ -31,3 +31,6 @@ Thumbs.db
 
 # Modal
 .modal/
+
+# YOLO model files (too large)
+*.pt
