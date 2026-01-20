@@ -63,14 +63,14 @@ async def startup():
     global detector, buffer_processor_task, detection_executor, encode_executor
     logger.info("Initializing YOLO detector with segmentation model...")
     # Using yolo26m-seg for good accuracy + real-time performance
-    # Options: yolo26s-seg (fast), yolo26m-seg (balanced), yolo26l-seg (accurate), yolo26x-seg (best)
+    # Options: yolo26n-seg (fast), yolo26m-seg (balanced), yolo26l-seg (accurate), yolo26x-seg (best)
     # imgsz: 640 (fast), 960 (balanced), 1280 (accurate)
     detector = DetectionService(
-        model_name="yolo26s-seg.pt",
+        model_name="yolo26n-seg.pt",
         use_tracking=True,
         imgsz=480,
     )
-    logger.info("YOLO detector ready (yolo26s-seg, ByteTrack, 480px - optimized for speed+segmentation)")
+    logger.info("YOLO detector ready (yolo26n-seg, ByteTrack, 480px - optimized for speed+segmentation)")
 
     # Initialize thread pools for parallel processing
     detection_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="yolo-")

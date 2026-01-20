@@ -56,7 +56,7 @@ class DetectionService:
     Supports ByteTrack for persistent object tracking.
     """
 
-    def __init__(self, model_name: str = "yolo26s-seg.pt", use_tracking: bool = True, imgsz: int = 960):
+    def __init__(self, model_name: str = "yolo26n-seg.pt", use_tracking: bool = True, imgsz: int = 960):
         """
         Initialize YOLO model.
 
