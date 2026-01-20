@@ -56,7 +56,7 @@ class ProcessingPipeline:
         self.ema_alpha_min = 0.05  # Minimum alpha for low-confidence detections
         self.ema_alpha_max = 0.35  # Maximum alpha for high-confidence detections
         self.velocity_alpha = 0.1  # Velocity smoothing
-        self.segment_interval = 3  # Re-segment every N frames (reduced to minimize lag)
+        self.segment_interval = 6  # Re-segment every N frames (reduced for faster host processing)
         self._last_segment_frame = 0
 
     def set_target_point(self, x: int, y: int):

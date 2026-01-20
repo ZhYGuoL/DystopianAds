@@ -8,6 +8,7 @@ import io
 import time
 from typing import Optional
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -44,16 +45,19 @@ selected_class_name: Optional[str] = None  # Fallback: track by class name
 last_frame_shape: tuple[int, int, int] = (480, 640, 3)  # Default shape, updated on each frame
 current_occlusion_mask: Optional[np.ndarray] = None  # Current person/hand occlusion mask
 
-# Frame buffer for viewer - stores (timestamp, frame, detections) tuples with 1 second delay
+# Frame buffer for viewer - stores (timestamp, frame, detections) tuples with minimal delay
 frame_buffer: deque = deque(maxlen=100)
 buffer_processor_task: Optional[asyncio.Task] = None
-BUFFER_DELAY_MS = 1000  # 1 second delay
+BUFFER_DELAY_MS = 100  # 100ms delay to let detections catch up
+
+# Thread pool for non-blocking YOLO inference
+detection_executor: Optional[ThreadPoolExecutor] = None
 
 
 @app.on_event("startup")
 async def startup():
     """Initialize services on startup."""
-    global detector, buffer_processor_task
+    global detector, buffer_processor_task, detection_executor
     logger.info("Initializing YOLO detector with segmentation model...")
     # Using yolo26m-seg for good accuracy + real-time performance
     # Options: yolo26s-seg (fast), yolo26m-seg (balanced), yolo26l-seg (accurate), yolo26x-seg (best)
@@ -64,6 +68,9 @@ async def startup():
         imgsz=480,
     )
     logger.info("YOLO detector ready (yolo26s-seg, ByteTrack, 480px - optimized for speed+segmentation)")
+
+    # Initialize thread pool for non-blocking YOLO inference
+    detection_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="yolo-")
 
     # Start background buffer processor task
     buffer_processor_task = asyncio.create_task(buffer_processor_loop())
@@ -104,14 +111,17 @@ async def capture_websocket(websocket: WebSocket):
                 # Store frame shape for use in click handling
                 last_frame_shape = frame.shape
 
-                # Run YOLO detection on every frame for responsive bounding boxes
-                if detector:  # Every frame
-                    # Use lower confidence and detect ALL objects for debugging
+                # Run YOLO detection every 3rd frame for faster viewer throughput
+                if detector and frame_count % 3 == 0:
+                    # Run detection in thread pool to avoid blocking event loop
                     detect_start = time.time()
-                    current_detections = detector.detect(
+                    loop = asyncio.get_event_loop()
+                    current_detections = await loop.run_in_executor(
+                        detection_executor,
+                        detector.detect,
                         frame,
-                        confidence_threshold=0.25,  # Lower threshold
-                        target_classes_only=False,  # Show ALL detections
+                        0.25,  # confidence_threshold
+                        False,  # target_classes_only
                     )
                     detect_time = (time.time() - detect_start) * 1000  # Convert to ms
                     if current_detections:
@@ -292,15 +302,18 @@ async def buffer_processor_loop():
             current_time = time.time()
             delay_threshold = BUFFER_DELAY_MS / 1000.0  # Convert to seconds
 
-            # Process ONE frame per iteration if available
-            if frame_buffer:
+            # Process all frames that are old enough (drain buffer)
+            while frame_buffer:
                 oldest = frame_buffer[0]
                 if current_time - oldest['timestamp'] >= delay_threshold:
                     frame_data = frame_buffer.popleft()
                     await process_buffered_frame(frame_data, current_time)
+                    current_time = time.time()  # Update time after processing
+                else:
+                    break  # Oldest frame not ready yet
 
-            # Sleep briefly to avoid busy-waiting
-            await asyncio.sleep(0.01)  # 10ms
+            # Sleep very briefly to yield to other tasks
+            await asyncio.sleep(0.001)  # 1ms
 
         except Exception as e:
             logger.error(f"Buffer processor loop error: {e}")
@@ -313,12 +326,9 @@ async def process_buffered_frame(frame_data: dict, process_time: float):
     try:
         proc_start = time.time()
 
-        # Process frame through pipeline
-        processed = await pipeline.process_frame(
-            frame_data['frame'],
-            frame_data['frame_num'],
-            occlusion_mask=current_occlusion_mask,
-        )
+        # Use frame directly without heavy pipeline processing for viewer speed
+        # (pipeline processing adds object replacement which viewer doesn't need)
+        processed = frame_data['frame'].copy()
 
         # Draw ALL detections with segmentation contours
         contour_count = 0
